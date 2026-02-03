@@ -11,17 +11,12 @@ from torch.nn.utils.rnn import pad_sequence
 import webdataset as wds
 
 from accelerate import Accelerator, DistributedDataParallelKwargs
-try:
-    from accelerate import DeepSpeedPlugin
-except Exception:
-    DeepSpeedPlugin = None
 from custom_datasets import dataset_factory
 from eruku_continuous_inf import DDPCompatibleEmuru
 from hwd.datasets.shtg import KaraokeLines
 from torch.utils.data import Dataset
 from torchvision import transforms as T
 from PIL import Image
-import random
 
 
 def karaoke_collate_fn(batch):
@@ -31,27 +26,12 @@ def karaoke_collate_fn(batch):
         # Stack images/tensors
         if key in ['style_img', 'gen_img']:
             tensorized = []
-            actual_widths = []  # Store actual widths before padding
             for v in values:
                 if isinstance(v, torch.Tensor):
                     tensorized.append(v)
-                    actual_widths.append(v.shape[-1])  # Width is last dimension
                 else:  # Assume PIL Image
-                    tensor_v = transforms.ToTensor()(v)
-                    tensorized.append(tensor_v)
-                    actual_widths.append(tensor_v.shape[-1])
-            
-            # Pad images to same width for stacking
-            # Use pad_sequence to pad to the maximum width in the batch
-            images_for_padding = [rearrange(img, 'c h w -> w c h') for img in tensorized]
-            padded_images = pad_sequence(images_for_padding, padding_value=1.0)
-            out[key] = rearrange(padded_images, 'w b c h -> b c h w')
-            
-            # Store actual widths for proper visualization
-            if key == 'style_img':
-                out['style_img_width'] = actual_widths[0] if len(actual_widths) == 1 else actual_widths
-            elif key == 'gen_img':
-                out['gen_img_width'] = actual_widths[0] if len(actual_widths) == 1 else actual_widths
+                    tensorized.append(transforms.ToTensor()(v))
+            out[key] = torch.stack(tensorized)
         elif isinstance(values[0], (str, int, float)):
             out[key] = values
         elif isinstance(values[0], (list, tuple)):
@@ -76,12 +56,12 @@ class Config:
     LEARNING_RATE = 0.0001
     WEIGHT_DECAY = 0.01
     MAX_EPOCHS = 2500
-    MAX_IMG_LEN = 32768
+    MAX_IMG_LEN = 8192
     
     # Data paths
     DATASETS_ROOT = '/mnt/nas/datasets/'
-    TRAIN_PATTERN = "/gpfs/scratch/ehpc290/font-square-pretrain-20M/{000000..002291}.tar"
-    CHECKPOINT_DIR = "/gpfs/projects/ehpc290/eruku_checkpoints"
+    TRAIN_PATTERN = "/scratch/project_465002151/font-square-pretrain-20M/{000000..002291}.tar"
+    CHECKPOINT_DIR = "/scratch/project_465002151/eruku_checkpoints"
     
     # Training settings
     NUM_WORKERS = 1
@@ -92,19 +72,12 @@ class Config:
     PROJECT_NAME = 'Eruku_continuous'
     CHECKPOINT_SAVE_FREQUENCY = 1  # Save every N epochs
     LOG_CHECKPOINT_SAMPLES = 48000 # Log and checkpoint every N samples
-    # Debug
-    GRAD_SYNC_DEBUG = False
 
     # CFG settings
     GEN_TEXT_DROPOUT_PROB = 0.05
     CFG_SCALES = [1, 1.5, 1.75, 2.0, 2.25]
     PERFORM_CFG = False
-    CFG_DROP_IMAGE = False
 
-    # Debug / DeepSpeed
-    GRAD_SYNC_DEBUG = False
-    USE_DEEPSPEED = False
-    DS_ZERO_STAGE = 2
 
 class DataProcessor:
     """Handles data loading and processing operations"""
@@ -186,8 +159,11 @@ class DataProcessor:
     @staticmethod
     def validate_widths(style_width, gen_width):
         """Validate and fix width values to prevent DDP issues"""
-        # Don't artificially cap style_width at half - use actual content width
-        # Only ensure minimum widths and that total doesn't exceed max
+        style_width = min(style_width, Config.MAX_IMG_LEN // 2)
+        remaining_width = Config.MAX_IMG_LEN - style_width
+        gen_width = min(gen_width, remaining_width)
+        
+        # Ensure minimum widths
         style_width = max(style_width, 64)
         gen_width = max(gen_width, 64)
         
@@ -196,23 +172,6 @@ class DataProcessor:
             total = style_width + gen_width
             style_width = int(style_width * Config.MAX_IMG_LEN / total)
             gen_width = Config.MAX_IMG_LEN - style_width
-        
-        return style_width, gen_width
-    
-    @staticmethod
-    def validate_widths_against_images(style_width, gen_width, style_img, gen_img):
-        """Additional validation to ensure widths don't exceed actual image content"""
-        if style_img is not None:
-            actual_style_width = style_img.shape[-1]
-            if style_width > actual_style_width:
-                print(f"[WIDTH WARNING] Style width {style_width} exceeds actual image width {actual_style_width}")
-                style_width = actual_style_width
-        
-        if gen_img is not None:
-            actual_gen_width = gen_img.shape[-1]
-            if gen_width > actual_gen_width:
-                print(f"[WIDTH WARNING] Gen width {gen_width} exceeds actual image width {actual_gen_width}")
-                gen_width = actual_gen_width
         
         return style_width, gen_width
 
@@ -238,9 +197,9 @@ def collate_pairs_hf(batch):
     gen_widths = []
     
     for sample in batch:
-        # Use actual content widths from JSON, don't artificially cap them
-        style_width = sample['json']['style_img_width']
-        gen_width = sample['json']['gen_img_width']
+        style_width = min(sample['json']['style_img_width'], Config.MAX_IMG_LEN // 2)
+        remaining_width = Config.MAX_IMG_LEN - style_width
+        gen_width = min(sample['json']['gen_img_width'], remaining_width)
         
         style_width, gen_width = processor.validate_widths(style_width, gen_width)
         style_widths.append(style_width)
@@ -342,32 +301,10 @@ class TrainingManager:
         
         # Initialize accelerator
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-        if getattr(self.config, 'USE_DEEPSPEED', False) and DeepSpeedPlugin is not None:
-            ds_plugin = DeepSpeedPlugin(
-                zero_stage=getattr(self.config, 'DS_ZERO_STAGE', 2),
-                gradient_accumulation_steps=gradient_accumulation_steps
-            )
-            self.accelerator = Accelerator(
-                gradient_accumulation_steps=gradient_accumulation_steps,
-                kwargs_handlers=[ddp_kwargs],
-                deepspeed_plugin=ds_plugin
-            )
-            if self.accelerator.is_main_process:
-                print(f"DeepSpeed enabled: ZeRO-{getattr(self.config, 'DS_ZERO_STAGE', 2)}, bf16=True")
-        else:
-            self.accelerator = Accelerator(
-                gradient_accumulation_steps=gradient_accumulation_steps,
-                kwargs_handlers=[ddp_kwargs]
-            )
-
-        # Explicit distributed context visibility
-        if self.accelerator.is_main_process:
-            try:
-                import os
-                world_size_env = os.environ.get('WORLD_SIZE', 'unknown')
-                print(f"Distributed context: world_size={self.accelerator.num_processes} (env WORLD_SIZE={world_size_env}), main_process_index={self.accelerator.process_index}")
-            except Exception:
-                pass
+        self.accelerator = Accelerator(
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            kwargs_handlers=[ddp_kwargs]
+        )
         
     def setup_model_and_optimizer(self):
         """Initialize model and optimizer"""
@@ -436,39 +373,13 @@ class TrainingManager:
             
             self.model.load_state_dict(model_state_dict, strict=False)
             
-            # Load optimizer state only when resuming the SAME run/architecture
-            # Cross-architecture resume (e.g., quantized -> continuous) must rebuild optimizer state
-            if 'optimizer' in checkpoint and not override_checkpoint_run_name:
+            # Load optimizer state
+            if 'optimizer' in checkpoint:
                 try:
                     self.optimizer.load_state_dict(checkpoint['optimizer'])
                     print("Loaded optimizer state")
-                    # Validate that loaded state tensors match current parameter shapes
-                    state_is_compatible = True
-                    try:
-                        for group in self.optimizer.param_groups:
-                            for param in group['params']:
-                                st = self.optimizer.state.get(param, None)
-                                if st is None:
-                                    continue
-                                exp_avg = st.get('exp_avg', None)
-                                exp_avg_sq = st.get('exp_avg_sq', None)
-                                if (exp_avg is not None and exp_avg.shape != param.shape) or \
-                                   (exp_avg_sq is not None and exp_avg_sq.shape != param.shape):
-                                    state_is_compatible = False
-                                    break
-                            if not state_is_compatible:
-                                break
-                    except Exception:
-                        state_is_compatible = False
-
-                    if not state_is_compatible:
-                        print("Incompatible optimizer state detected after load. Resetting optimizer state to avoid runtime errors.")
-                        # Clear optimizer state so it will be re-initialized on first step
-                        self.optimizer.state = {}
                 except Exception as e:
                     print(f"Warning: Could not load optimizer state: {e}")
-            elif 'optimizer' in checkpoint and override_checkpoint_run_name:
-                print("Skipping optimizer state load due to override_checkpoint_run_name (cross-run/architecture resume)")
             
             start_epoch = checkpoint['epoch'] + 1
             self.global_step = checkpoint.get('global_step', 0)
@@ -548,76 +459,11 @@ class TrainingManager:
         ce_loss = model_out[0]['ce_loss']
         ocr_loss = model_out[0]['ocr_loss']
 
-
         self.accelerator.backward(loss)
-
-        # Verify gradient synchronization when gradients are about to be applied
-        if self.config.GRAD_SYNC_DEBUG and self.accelerator.sync_gradients:
-            try:
-                self._verify_gradient_sync()
-            except Exception as _e:
-                if self.accelerator.is_main_process:
-                    print(f"[GRAD SYNC DEBUG] Verification failed with exception: {_e}")
         self.optimizer.step()
         self.optimizer.zero_grad()
         
         return model_out, loss, mse_loss, ce_loss, ocr_loss
-
-    def _verify_gradient_sync(self):
-        """Check that reduced gradients are identical across ranks.
-
-        Computes simple scalar summaries (L2 sum and absolute sum) over all gradients
-        and gathers them across processes. If synchronization is correct, these
-        statistics should match (within tolerance) on all ranks.
-        """
-        total_l2_sum = torch.tensor(0.0, device=self.accelerator.device)
-        total_abs_sum = torch.tensor(0.0, device=self.accelerator.device)
-        num_grads = 0
-
-        model = self.model.module if hasattr(self.model, 'module') else self.model
-        for param in model.parameters():
-            if param.grad is None:
-                continue
-            grad = param.grad.detach()
-            if not torch.is_finite(grad).all():
-                grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
-            # Use float32 for stable statistics
-            grad32 = grad.float()
-            total_l2_sum += torch.sum(grad32 * grad32)
-            total_abs_sum += torch.sum(torch.abs(grad32))
-            num_grads += 1
-
-        local_stats = torch.stack([
-            total_l2_sum,
-            total_abs_sum
-        ])  # shape [2]
-
-        gathered = self.accelerator.gather(local_stats.unsqueeze(0))  # [world, 2] ideally
-        if gathered.dim() == 1:
-            # Fallback reshape if backend flattened
-            gathered = gathered.view(-1, local_stats.shape[0])
-
-        # Compare first and last as a quick check; then full-range if mismatch
-        l2_vals = gathered[:, 0]
-        abs_vals = gathered[:, 1]
-
-        def _within_tol(t: torch.Tensor, rtol: float = 1e-4, atol: float = 1e-6) -> bool:
-            return bool((t.max() - t.min()) <= (atol + rtol * t.abs().max()))
-
-        l2_ok = _within_tol(l2_vals)
-        abs_ok = _within_tol(abs_vals)
-        all_ok = l2_ok and abs_ok
-
-        if self.accelerator.is_main_process:
-            world_size = self.accelerator.num_processes
-            if all_ok:
-                print(f"[GRAD SYNC DEBUG] OK on step {self.global_step}: world_size={world_size}, L2/ABS stats synchronized.")
-            else:
-                print(f"[GRAD SYNC DEBUG] MISMATCH on step {self.global_step}: world_size={world_size}")
-                print(f"  L2 stats per-rank: {l2_vals.tolist()}")
-                print(f"  ABS stats per-rank: {abs_vals.tolist()}")
-
-        return all_ok
     
     def evaluation_step(self):
         """Perform distributed evaluation on the validation set"""
@@ -639,65 +485,28 @@ class TrainingManager:
         last_batch = None
         last_embeddings = None
         last_model_out = None
-        last_original_batch = None
         last_batch_no_style = None
         last_embeddings_no_style = None
         last_model_out_no_style = None
         
         with torch.no_grad():
             for batch in tqdm(self.eval_loader, desc='Evaluation', disable=not self.accelerator.is_main_process):
-                # Use actual width values from the batch, not padded image shapes
-                if 'style_img_width' in batch and 'gen_img_width' in batch:
-                    # For evaluation datasets that provide width information
-                    # Convert to int if tensor for proper indexing
-                    validated_style_width = batch['style_img_width']
-                    validated_gen_width = batch['gen_img_width']
-                    if isinstance(validated_style_width, torch.Tensor):
-                        validated_style_width = validated_style_width.item()
-                    if isinstance(validated_gen_width, torch.Tensor):
-                        validated_gen_width = validated_gen_width.item()
-                    
-                    # Debug logging for width information from dataset
-                    if self.accelerator.is_main_process:
-                        print(f"[EVAL DEBUG] Using dataset-provided widths - Style: {validated_style_width}, Gen: {validated_gen_width}, "
-                              f"Image shapes - Style: {batch['style_img'].shape}, Gen: {batch['same_img'].shape}")
-                else:
-                    # Fallback for datasets without width info - detect actual content width
-                    # This should rarely be used now that karaoke_collate_fn provides widths
-                    style_img = batch['style_img'][0]  # Take first sample
-                    gen_img = batch['same_img'][0]     # Take first sample
-                    
-                    # Simple fallback: use 80% of image width as estimate
-                    estimated_style_width = int(style_img.shape[-1] * 0.8)
-                    estimated_gen_width = int(gen_img.shape[-1] * 0.8)
-                    
-                    # Debug logging for fallback usage
-                    if self.accelerator.is_main_process:
-                        print(f"[EVAL DEBUG] Using fallback width estimation - Style: {estimated_style_width}, Gen: {estimated_gen_width}")
-                    
-                    validated_style_width, validated_gen_width = self.processor.validate_widths(
-                        estimated_style_width, estimated_gen_width
-                    )
+                # Validate widths for evaluation batch
+                raw_style_width = batch['style_img'].shape[-1]
+                raw_gen_width = batch['same_img'].shape[-1]
+                validated_style_width, validated_gen_width = self.processor.validate_widths(
+                    raw_style_width, raw_gen_width
+                )
                 
                 # Prepare evaluation batch with style text
-                # For karaoke evaluation, we need to concatenate style and gen images
-                # to match the training data format where style_img_width is a boundary
-                style_img_cropped = batch['style_img'][:, :, :int(validated_style_width)]
-                gen_img_cropped = batch['same_img'][:, :, :int(validated_gen_width)]
-                
-                # Concatenate style and gen images horizontally
-                combined_img = torch.cat([style_img_cropped, gen_img_cropped], dim=-1)
-                
                 eval_batch = {
-                    'style_img': combined_img,  # Combined image like in training
-                    'gen_img': combined_img,    # Same combined image
-                    'style_img_width': validated_style_width,  # Boundary where style ends
-                    'gen_img_width': validated_style_width + validated_gen_width,  # Total width
+                    'style_img': batch['style_img'],
+                    'gen_img': batch['same_img'],
+                    'style_img_width': validated_style_width,
+                    'gen_img_width': validated_gen_width,
                     'style_text': batch['style_text'],
                     'gen_text': batch['same_text'],
-                    'style_text_dropped': [False] * len(batch['style_text']),
-                    'validated_style_width': validated_style_width,  # Store for visualization
-                    'validated_gen_width': validated_gen_width       # Store for visualization
+                    'style_text_dropped': [False] * len(batch['style_text'])
                 }
                 
                 # Get model inputs and run forward pass
@@ -721,19 +530,16 @@ class TrainingManager:
                     last_batch = eval_batch
                     last_embeddings = embeddings
                     last_model_out = model_out
-                    last_original_batch = batch  # Store original batch for visualization
                 
                 # Evaluate same batch without style text
                 eval_batch_no_style = {
-                    'style_img': combined_img,  # Same combined image
-                    'gen_img': combined_img,    # Same combined image
-                    'style_img_width': validated_style_width,  # Boundary where style ends
-                    'gen_img_width': validated_style_width + validated_gen_width,  # Total width
+                    'style_img': batch['style_img'],
+                    'gen_img': batch['same_img'],
+                    'style_img_width': validated_style_width,
+                    'gen_img_width': validated_gen_width,
                     'style_text': [""] * len(batch['style_text']),  # Empty style text
                     'gen_text': batch['same_text'],
-                    'style_text_dropped': [True] * len(batch['style_text']),
-                    'validated_style_width': validated_style_width,  # Store for visualization
-                    'validated_gen_width': validated_gen_width       # Store for visualization
+                    'style_text_dropped': [True] * len(batch['style_text'])
                 }
                 
                 # Get model inputs and run forward pass for no-style version
@@ -774,7 +580,6 @@ class TrainingManager:
             'last_batch': last_batch,
             'last_embeddings': last_embeddings,
             'last_model_out': last_model_out,
-            'last_original_batch': last_original_batch, # Add this line
             'last_batch_no_style': last_batch_no_style,
             'last_embeddings_no_style': last_embeddings_no_style,
             'last_model_out_no_style': last_model_out_no_style
@@ -787,14 +592,6 @@ class TrainingManager:
         
         # Training visualization
         model_latent = model_out[1]
-        
-        # Debug logging for training data boundaries (occasionally)
-        if self.accelerator.is_main_process and hasattr(sample, 'get') and random.random() < 0.01:  # 1% chance
-            style_width = sample['style_img_width'][0].item() if isinstance(sample['style_img_width'], torch.Tensor) else sample['style_img_width']
-            gen_width = sample['gen_img_width'][0].item() if isinstance(sample['gen_img_width'], torch.Tensor) else sample['gen_img_width']
-            total_width = sample['style_img'].shape[-1]
-            print(f"[TRAIN DEBUG] Style width: {style_width}, Gen width: {gen_width}, Total img width: {total_width}, "
-                  f"Style text: '{sample['style_text'][0][:20]}...', Gen text: '{sample['gen_text'][0][:20]}...'")
         
         if hasattr(self.model, 'module'):
             output = torch.clamp(self.model.module.module_vae_decode(model_latent).sample, 0, 1)
@@ -811,15 +608,9 @@ class TrainingManager:
         
         # Check if any samples in the batch have style text dropped
         has_style_dropped = any(sample.get('style_text_dropped', [False]))
-
-        if self.config.PERFORM_CFG:
-            for cfg_scale in self.config.CFG_SCALES:
-                cfg_gen_test = self.model.module.module_continue_gen_test(input_img, {**sample, **model_inputs}, cfg_scale=cfg_scale)
-                wandb_data[f'synth_gen_test_cfg_{cfg_scale}'] = wandb.Image(
-                    cfg_gen_test,
-                    caption=f"CFG: {cfg_scale}, Style: {sample['style_text'][0]}, Gen: {sample['gen_text'][0]}{rank_info}"
-                )
-        elif has_style_dropped:
+        
+        # Create separate visualizations for samples with and without style text
+        if has_style_dropped:
             # Find samples with and without style text
             with_style_indices = [i for i, dropped in enumerate(sample.get('style_text_dropped', [])) if not dropped]
             without_style_indices = [i for i, dropped in enumerate(sample.get('style_text_dropped', [])) if dropped]
@@ -865,32 +656,23 @@ class TrainingManager:
                 )
         else:
             # Regular visualization when no style text is dropped
-            if self.config.PERFORM_CFG:
-                for cfg_scale in self.config.CFG_SCALES:
-                    cfg_gen_test = self.model.module.module_continue_gen_test(input_img, {**sample, **model_inputs}, cfg_scale=cfg_scale)
-                    wandb_data[f'synth_gen_test_cfg_{cfg_scale}'] = wandb.Image(
-                        cfg_gen_test,
-                        caption=f"CFG: {cfg_scale}, Style: {sample['style_text'][0]}, Gen: {sample['gen_text'][0]}{rank_info}"
-                    )
+            if hasattr(self.model, 'module'):
+                synth_gen_test = self.model.module.module_continue_gen_test(input_img, {**sample, **model_inputs})
             else:
-                if hasattr(self.model, 'module'):
-                    synth_gen_test = self.model.module.module_continue_gen_test(input_img, {**sample, **model_inputs})
-                else:
-                    synth_gen_test = self.model.continue_gen_test(input_img, {**sample, **model_inputs})
-                wandb_data['synth_img'] = wandb.Image(
-                    make_grid(out, nrow=1, normalize=True),
-                    caption=f"Style: {'|'.join(sample['style_text'])}, Gen: {'|'.join(sample['gen_text'])}{rank_info}"
-                )
-                wandb_data['synth_gen_test'] = wandb.Image(
-                    synth_gen_test,
-                    caption=f"Style: {sample['style_text'][0]}, Gen: {sample['gen_text'][0]}{rank_info}"
-                )
+                synth_gen_test = self.model.continue_gen_test(input_img, {**sample, **model_inputs})
+            wandb_data['synth_img'] = wandb.Image(
+                make_grid(out, nrow=1, normalize=True),
+                caption=f"Style: {'|'.join(sample['style_text'])}, Gen: {'|'.join(sample['gen_text'])}{rank_info}"
+            )
+            wandb_data['synth_gen_test'] = wandb.Image(
+                synth_gen_test,
+                caption=f"Style: {sample['style_text'][0]}, Gen: {sample['gen_text'][0]}{rank_info}"
+            )
         
         # Evaluation visualization with style text (only on main process)
         eval_batch = eval_results['last_batch']
         embeddings = eval_results['last_embeddings']
         eval_model_out = eval_results['last_model_out']
-        original_batch = eval_results['last_original_batch']  # Get original batch for visualization
         
         if eval_batch is not None and embeddings is not None and eval_model_out is not None:
             eval_model_latent = eval_model_out[1]
@@ -909,10 +691,8 @@ class TrainingManager:
                 real_gen_test = self.model.continue_gen_test(eval_input_img, {**eval_batch, **embeddings})
             
             eval_out = torch.cat([
-                # Use original separate images for visualization, not the combined image
-                # Crop to actual content width instead of showing full padded images
-                original_batch['style_img'][:, :, :int(eval_batch['validated_style_width'])].cuda(),
-                original_batch['same_img'][:, :, :int(eval_batch['validated_gen_width'])].cuda(),
+                self.processor.pad_images(eval_batch['style_img']).cuda(),
+                self.processor.pad_images(eval_batch['gen_img']).cuda(),
                 eval_output.repeat(1, 3, 1, 1)
             ], dim=-1)
             
@@ -924,54 +704,43 @@ class TrainingManager:
                 real_gen_test,
                 caption=f"WITH STYLE - Style: {eval_batch['style_text'][0]}, Gen: {eval_batch['gen_text'][0]}"
             )
-            if self.config.PERFORM_CFG:
-                for cfg_scale in self.config.CFG_SCALES:
-                    cfg_gen_test = self.model.module.module_continue_gen_test(eval_input_img, {**eval_batch, **embeddings}, cfg_scale=cfg_scale)
-                    wandb_data[f'real_gen_test_cfg_{cfg_scale}'] = wandb.Image(
-                        cfg_gen_test,
-                        caption=f"CFG: {cfg_scale}, Style: {'|'.join(flatten(eval_batch['style_text']))}, Gen: {'|'.join(flatten(eval_batch['gen_text']))}"
-                    )
         
         # Evaluation visualization without style text (only on main process)
-
-        if has_style_dropped:
-            eval_batch_no_style = eval_results['last_batch_no_style']
-            embeddings_no_style = eval_results['last_embeddings_no_style']
-            eval_model_out_no_style = eval_results['last_model_out_no_style']
+        eval_batch_no_style = eval_results['last_batch_no_style']
+        embeddings_no_style = eval_results['last_embeddings_no_style']
+        eval_model_out_no_style = eval_results['last_model_out_no_style']
+        
+        if eval_batch_no_style is not None and embeddings_no_style is not None and eval_model_out_no_style is not None:
+            eval_model_latent_no_style = eval_model_out_no_style[1]
             
-            if eval_batch_no_style is not None and embeddings_no_style is not None and eval_model_out_no_style is not None:
-                eval_model_latent_no_style = eval_model_out_no_style[1]
-                
-                if hasattr(self.model, 'module'):
-                    eval_output_no_style = torch.clamp(self.model.module.module_vae_decode(eval_model_latent_no_style).sample, 0, 1)
-                    eval_gt_latent_no_style = rearrange(embeddings_no_style['decoder_inputs_embeds'], 'b w (h c) -> b c h w',
-                                                    b=eval_model_latent_no_style.shape[0], h=8, c=1)
-                    eval_input_img_no_style = torch.clamp(self.model.module.module_vae_decode(eval_gt_latent_no_style).sample, 0, 1)
-                    real_gen_test_no_style = self.model.module.module_continue_gen_test(eval_input_img_no_style, {**eval_batch_no_style, **embeddings_no_style})
-                else:
-                    eval_output_no_style = torch.clamp(self.model.vae.decode(eval_model_latent_no_style).sample, 0, 1)
-                    eval_gt_latent_no_style = rearrange(embeddings_no_style['decoder_inputs_embeds'], 'b w (h c) -> b c h w',
-                                                    b=eval_model_latent_no_style.shape[0], h=8, c=1)
-                    eval_input_img_no_style = torch.clamp(self.model.vae.decode(eval_gt_latent_no_style).sample, 0, 1)
-                    real_gen_test_no_style = self.model.continue_gen_test(eval_input_img_no_style, {**eval_batch_no_style, **embeddings_no_style})
-                
-                eval_out_no_style = torch.cat([
-                    # Use original separate images for visualization, not the combined image
-                    # Crop to actual content width instead of showing full padded images
-                    original_batch['style_img'][:, :, :int(eval_batch_no_style['validated_style_width'])].cuda(),
-                    original_batch['same_img'][:, :, :int(eval_batch_no_style['validated_gen_width'])].cuda(),
-                    eval_output_no_style.repeat(1, 3, 1, 1)
-                ], dim=-1)
-                
-                wandb_data['real_img_without_style'] = wandb.Image(
-                    make_grid(eval_out_no_style, nrow=1, normalize=True),
-                    caption=f"WITHOUT STYLE - Style: {'|'.join(flatten(eval_batch_no_style['style_text']))}, Gen: {'|'.join(flatten(eval_batch_no_style['gen_text']))}"
-                )
-                wandb_data['real_gen_test_without_style'] = wandb.Image(
-                    real_gen_test_no_style,
-                    caption=f"WITHOUT STYLE - Style: {eval_batch_no_style['style_text'][0]}, Gen: {eval_batch_no_style['gen_text'][0]}"
-                )
+            if hasattr(self.model, 'module'):
+                eval_output_no_style = torch.clamp(self.model.module.module_vae_decode(eval_model_latent_no_style).sample, 0, 1)
+                eval_gt_latent_no_style = rearrange(embeddings_no_style['decoder_inputs_embeds'], 'b w (h c) -> b c h w',
+                                                  b=eval_model_latent_no_style.shape[0], h=8, c=1)
+                eval_input_img_no_style = torch.clamp(self.model.module.module_vae_decode(eval_gt_latent_no_style).sample, 0, 1)
+                real_gen_test_no_style = self.model.module.module_continue_gen_test(eval_input_img_no_style, {**eval_batch_no_style, **embeddings_no_style})
+            else:
+                eval_output_no_style = torch.clamp(self.model.vae.decode(eval_model_latent_no_style).sample, 0, 1)
+                eval_gt_latent_no_style = rearrange(embeddings_no_style['decoder_inputs_embeds'], 'b w (h c) -> b c h w',
+                                                  b=eval_model_latent_no_style.shape[0], h=8, c=1)
+                eval_input_img_no_style = torch.clamp(self.model.vae.decode(eval_gt_latent_no_style).sample, 0, 1)
+                real_gen_test_no_style = self.model.continue_gen_test(eval_input_img_no_style, {**eval_batch_no_style, **embeddings_no_style})
             
+            eval_out_no_style = torch.cat([
+                self.processor.pad_images(eval_batch_no_style['style_img']).cuda(),
+                self.processor.pad_images(eval_batch_no_style['gen_img']).cuda(),
+                eval_output_no_style.repeat(1, 3, 1, 1)
+            ], dim=-1)
+            
+            wandb_data['real_img_without_style'] = wandb.Image(
+                make_grid(eval_out_no_style, nrow=1, normalize=True),
+                caption=f"WITHOUT STYLE - Style: {'|'.join(flatten(eval_batch_no_style['style_text']))}, Gen: {'|'.join(flatten(eval_batch_no_style['gen_text']))}"
+            )
+            wandb_data['real_gen_test_without_style'] = wandb.Image(
+                real_gen_test_no_style,
+                caption=f"WITHOUT STYLE - Style: {eval_batch_no_style['style_text'][0]}, Gen: {eval_batch_no_style['gen_text'][0]}"
+            )
+        
         return wandb_data
     
     def save_checkpoint(self, epoch, output_dir, wandb_id):
@@ -1058,12 +827,9 @@ class TrainingManager:
                         actual_batch_size = len(sample['style_text'])
                         style_img_shape = sample['style_img'].shape
                         gen_img_shape = sample['gen_img'].shape
-                        style_width = sample['style_img_width'][0].item() if isinstance(sample['style_img_width'], torch.Tensor) else sample['style_img_width']
-                        gen_width = sample['gen_img_width'][0].item() if isinstance(sample['gen_img_width'], torch.Tensor) else sample['gen_img_width']
                         print(f"[GPU {self.accelerator.process_index}] Epoch {epoch} Batch {batch_count}: "
                               f"actual_batch_size={actual_batch_size}, "
                               f"style_img_shape={style_img_shape}, gen_img_shape={gen_img_shape}, "
-                              f"style_width={style_width}, gen_width={gen_width}, "
                               f"style_sample='{sample['style_text'][0][:30]}...', "
                               f"gen_sample='{sample['gen_text'][0][:30]}...'")
                     
@@ -1243,12 +1009,6 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--cfg-drop-img",
-        action="store_true",
-        help="Enable CFG on image and text"
-    )
-
-    parser.add_argument(
         "--ft-dataset",
         action="store_true",
         help="Use the ft dataset"
@@ -1268,26 +1028,6 @@ def parse_args():
         help="Override max image length"
     )
     
-    # Removed duplicate definition of --grad-sync-debug
-    parser.add_argument(
-        "--use-deepspeed",
-        action="store_true",
-        help="Enable DeepSpeed via Accelerate's DeepSpeedPlugin"
-    )
-    parser.add_argument(
-        "--ds-zero-stage",
-        type=int,
-        default=2,
-        choices=[1, 2, 3],
-        help="DeepSpeed ZeRO optimization stage"
-    )
-    
-    parser.add_argument(
-        "--grad-sync-debug",
-        action="store_true",
-        help="Verify gradient synchronization (checks grad stats across ranks at each sync step)"
-    )
-    
     return parser.parse_args()
 
 
@@ -1298,28 +1038,13 @@ def main():
     
     # Override config with CLI arguments
     config.STYLE_TEXT_DROPOUT_PROB = args.style_text_dropout_prob
-    if args.ft_dataset:
-        config.TRAIN_PATTERN = "/gpfs/scratch/ehpc290/font-square-pairs-ft/{000000..000988}.tar"
-        config.MAX_IMG_LEN = 32768
-        config.BATCH_SIZE = 2
+    config.PERFORM_CFG = args.with_cfg
     if args.override_batch_size is not None:
         config.BATCH_SIZE = args.override_batch_size
     if args.override_max_img_len is not None:
         config.MAX_IMG_LEN = args.override_max_img_len
-
-    if args.with_cfg:
-        config.CFG_SCALES = [1, 1.25, 1.5, 1.75, 2.0, 2.25]
-        config.PERFORM_CFG = True
-
-    if args.cfg_drop_img:
-        config.PERFORM_CFG = True
-        config.CFG_DROP_IMAGE = True
-        config.CFG_SCALES = [1, 1.25, 1.5, 1.75, 2.0, 2.25]
-
-    # Debug / DeepSpeed flags
-    config.GRAD_SYNC_DEBUG = args.grad_sync_debug
-    config.USE_DEEPSPEED = args.use_deepspeed
-    config.DS_ZERO_STAGE = args.ds_zero_stage
+    if args.ft_dataset:
+        config.TRAIN_PATTERN = "/scratch/project_465002151/font-square-pairs-ft/{000000..000988}.tar"
 
 
     # Initialize training manager
@@ -1346,13 +1071,6 @@ def main():
     
     if args.alpha != 1.0:
         trainer.model.module.alpha = args.alpha
-    if args.with_cfg:
-        trainer.model.module.dropout_probability = 0.05
-        trainer.model.module.drop_text = True
-    if args.cfg_drop_img:
-        trainer.model.module.dropout_probability = 0.05
-        trainer.model.module.drop_text = True
-        trainer.model.module.drop_img = True
 
     # Start training with custom run name
     trainer.train(start_epoch, wandb_id, run_name=run_name)
