@@ -180,8 +180,13 @@ class Emuru(torch.nn.Module):
                 sl_tensor = style_len[el] if hasattr(style_len, '__getitem__') else style_len
                 sl = _safe_int_from_maybe_tensor(sl_tensor)
 
-            # Ensure widths are within bounds
-            sl = max(64, min(sl, style_img_embeds.shape[-1]))
+            # Ensure widths are within bounds. sl is a pixel-space length
+            # (it's used below as sl//8 to index into the latent-space
+            # embeds), so it must be compared against a pixel-space bound --
+            # style_img_embeds.shape[-1] is already latent-space, so it needs
+            # the *8 to convert back. Without it, sl gets clamped to at most
+            # ~1/8th of the intended style context.
+            sl = max(64, min(sl, style_img_embeds.shape[-1] * 8))
             
             # Start with style image embeds
             sample_embeds_parts = [style_img_embeds[el,:,:,:sl//8]]
@@ -194,7 +199,7 @@ class Emuru(torch.nn.Module):
                     gl_tensor = gen_len[el] if hasattr(gen_len, '__getitem__') else gen_len
                     gl = _safe_int_from_maybe_tensor(gl_tensor)
 
-                gl = max(64, min(gl, gen_img_embeds.shape[-1]))
+                gl = max(64, min(gl, gen_img_embeds.shape[-1] * 8))  # same pixel/latent unit fix as sl above
                 sample_embeds_parts.extend([
                     torch.ones(1, 8, 1).to(self.T5.device), # SOG token placeholder
                     gen_img_embeds[el,:,:,:gl//8],
